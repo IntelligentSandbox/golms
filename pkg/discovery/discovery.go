@@ -49,7 +49,6 @@ func ListAllLLMs() (map[string][]string, error) {
 			}
 		}
 	}
-	
 
 	return llmStringMap, nil
 }

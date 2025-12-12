@@ -1,0 +1,174 @@
+package server
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/changminbark/golms/pkg/constants"
+	"github.com/changminbark/golms/pkg/discovery"
+)
+
+type MlxLMServerManager struct {
+	llm  string
+	port int // Port the server is running on
+}
+
+func (m MlxLMServerManager) IsAvailable() bool {
+	modelServerList, _ := discovery.ListAllModelServers()
+	return slices.Contains(modelServerList, constants.Mlx_lm)
+}
+
+func (m MlxLMServerManager) IsRunning() (bool, int) {
+	// Check if python processes are running
+	cmd := exec.Command("pgrep", "python")
+	pgrepPython, err := cmd.Output()
+	if err != nil {
+		fmt.Print("Pgrep on python encountered an error\n")
+		return false, -1
+	}
+	pgrepPythonString := string(pgrepPython)
+	pgrepPythonStringList := strings.Split(pgrepPythonString, "\n")
+
+	// Check if any of the python processes contain mlx_lm.server
+	for _, process := range pgrepPythonStringList {
+		process = strings.TrimSpace(process)
+		if process == "" {
+			continue
+		}
+
+		// Use ps to get the full command line for this PID
+		cmd = exec.Command("ps", "-p", process, "-o", "command=")
+		psOutput, err := cmd.Output()
+		if err != nil {
+			continue // Process might have terminated
+		}
+
+		// Check if the command contains mlx_lm.server
+		if strings.Contains(string(psOutput), "mlx_lm.server") {
+			pid, _ := strconv.Atoi(process)
+			return true, pid
+		}
+	}
+	return false, -1
+}
+
+func (m *MlxLMServerManager) Start() error {
+	fmt.Print("Starting the mlx_lm model server\n")
+
+	// Build model path
+	var modelPath string
+	if homePath, err := os.UserHomeDir(); err != nil {
+		return err
+	} else {
+		modelPath = path.Join(homePath, "/golms", constants.Mlx_lm, m.llm)
+	}
+
+	// Check if model path exists
+	if _, err := os.Stat(modelPath); os.IsNotExist(err) {
+		return fmt.Errorf("model path does not exist: %s", modelPath)
+	}
+
+	// Create log file for server output
+	logFile, err := os.Create("/tmp/mlx_lm_server.log")
+	if err != nil {
+		return fmt.Errorf("failed to create log file: %w", err)
+	}
+
+	// Set the port we'll use
+	m.port = 8080
+
+	// Run command in background
+	cmd := exec.Command("mlx_lm.server", "--model", modelPath, "--host", "127.0.0.1", "--port", strconv.Itoa(m.port))
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
+	if err := cmd.Start(); err != nil {
+		logFile.Close()
+		return fmt.Errorf("failed to start mlx_lm.server: %w", err)
+	}
+
+	fmt.Printf("mlx_lm.server started with PID: %d\n", cmd.Process.Pid)
+	fmt.Println("Logs: /tmp/mlx_lm_server.log")
+
+	// Wait for server to start listening on the port
+	fmt.Print("Waiting for server to initialize")
+	for i := 0; i < 30; i++ {
+		time.Sleep(1 * time.Second)
+		fmt.Print(".")
+
+		// Check if server is listening on the port
+		running, pid := m.IsRunning()
+		if running {
+			// Verify port is listening
+			checkCmd := exec.Command("lsof", "-Pan", "-p", strconv.Itoa(pid), "-i")
+			if output, err := checkCmd.Output(); err == nil && len(output) > 0 {
+				// Port is listening
+				fmt.Println()
+				fmt.Printf("Server is listening on port %d\n", m.port)
+				return nil
+			}
+		}
+	}
+	fmt.Println()
+	fmt.Println("Warning: Server process started but may not be listening yet. Check logs at /tmp/mlx_lm_server.log")
+
+	return nil
+}
+
+func (m *MlxLMServerManager) Stop() error {
+	fmt.Print("Stopping the mlx_lm model server\n")
+
+	// Check if running
+	isRunning, pid := m.IsRunning()
+	if !isRunning {
+		return errors.New("mlx_lm.server is not running")
+	}
+	// Kill PID
+	if err := exec.Command("kill", "-9", strconv.Itoa(pid)).Run(); err != nil {
+		return fmt.Errorf("failed to kill process with pid %d: %w", pid, err)
+	}
+	// Reset port
+	m.port = 0
+	return nil
+}
+
+func (m *MlxLMServerManager) GetPort() (int, error) {
+	// Check if running
+	isRunning, pid := m.IsRunning()
+	if !isRunning {
+		return -1, errors.New("mlx_lm.server is not running")
+	}
+
+	// If we started the server and know the port, return it
+	if m.port > 0 {
+		return m.port, nil
+	}
+
+	// Otherwise, try to detect the port using lsof (for externally started servers)
+	cmd := exec.Command("lsof", "-Pan", "-p", strconv.Itoa(pid), "-i")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return -1, fmt.Errorf("failed to get port info: %w (try running: lsof -Pan -p %d -i)", err, pid)
+	}
+
+	// Parse port number from output
+	re := regexp.MustCompile(`:(\d+)\s+\(LISTEN\)`)
+	matches := re.FindStringSubmatch(string(output))
+	if len(matches) < 2 {
+		return -1, errors.New("no listening port found in lsof output")
+	}
+	port, err := strconv.Atoi(matches[1]) // This is the first group in regex match (\d+)
+	if err != nil {
+		return -1, fmt.Errorf("failed to parse port number: %w", err)
+	}
+
+	return port, nil
+}
